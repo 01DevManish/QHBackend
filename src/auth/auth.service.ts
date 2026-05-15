@@ -63,6 +63,8 @@ export class AuthService {
     const cleaned = phone.replace(/[^\d+]/g, '');
     if (cleaned.startsWith('+')) return cleaned;
     if (cleaned.length === 10) return `+91${cleaned}`;
+    if (cleaned.length === 12 && cleaned.startsWith('91')) return `+${cleaned}`;
+    if (cleaned.length === 11 && cleaned.startsWith('0')) return `+91${cleaned.slice(1)}`;
     return cleaned;
   }
 

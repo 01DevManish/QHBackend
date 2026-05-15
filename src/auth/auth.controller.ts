@@ -11,12 +11,85 @@ export class AuthController {
     private readonly db: DatabaseService
   ) {}
 
+  private isTwilioVerifyEnabled(): boolean {
+    return Boolean(
+      process.env.TWILIO_ACCOUNT_SID &&
+      process.env.TWILIO_AUTH_TOKEN &&
+      process.env.TWILIO_VERIFY_SERVICE_SID
+    );
+  }
+
+  private getTwilioAuthHeader(): string {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    if (!accountSid || !authToken) {
+      throw new Error('Twilio credentials are not configured.');
+    }
+    return `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString('base64')}`;
+  }
+
+  private async sendTwilioVerification(phone: string): Promise<void> {
+    const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+    if (!serviceSid) throw new Error('TWILIO_VERIFY_SERVICE_SID is not configured.');
+
+    const response = await fetch(`https://verify.twilio.com/v2/Services/${serviceSid}/Verifications`, {
+      method: 'POST',
+      headers: {
+        Authorization: this.getTwilioAuthHeader(),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        To: phone,
+        Channel: 'sms',
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Twilio send OTP failed: ${text}`);
+    }
+  }
+
+  private async checkTwilioVerification(phone: string, code: string): Promise<boolean> {
+    const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+    if (!serviceSid) throw new Error('TWILIO_VERIFY_SERVICE_SID is not configured.');
+
+    const response = await fetch(`https://verify.twilio.com/v2/Services/${serviceSid}/VerificationCheck`, {
+      method: 'POST',
+      headers: {
+        Authorization: this.getTwilioAuthHeader(),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        To: phone,
+        Code: code,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Twilio verify OTP failed: ${text}`);
+    }
+
+    const data = await response.json() as { valid?: boolean; status?: string };
+    return data.valid === true || data.status === 'approved';
+  }
+
   @Post('send-otp')
   async sendOtp(@Body() body: { phone: string }, @Headers('user-agent') userAgent: string, @Res() res: Response) {
     try {
       const phone = this.authService.normalizePhone(String(body.phone ?? ''));
       if (!/^\+[1-9]\d{9,14}$/.test(phone)) {
         return res.status(400).json({ error: 'Enter a valid phone number with country code.' });
+      }
+
+      if (this.isTwilioVerifyEnabled()) {
+        await this.sendTwilioVerification(phone);
+        return res.json({
+          ok: true,
+          phone,
+          provider: 'twilio-verify',
+        });
       }
 
       const otp = String(Math.floor(Math.random() * (999999 - 100000 + 1)) + 100000);
@@ -31,6 +104,7 @@ export class AuthController {
       return res.json({
         ok: true,
         phone,
+        provider: 'local',
         devOtp: process.env.NODE_ENV === 'production' ? undefined : otp,
       });
     } catch (error) {
@@ -43,42 +117,50 @@ export class AuthController {
     try {
       const phone = this.authService.normalizePhone(String(body.phone ?? ''));
       const otp = String(body.otp ?? '').replace(/\D/g, '');
+      const provider = this.isTwilioVerifyEnabled() ? 'twilio-verify' : 'local';
 
       if (!/^\+[1-9]\d{9,14}$/.test(phone) || otp.length !== 6) {
         return res.status(400).json({ error: 'Enter a valid phone number and 6-digit OTP.' });
       }
 
-      const otpResult = await this.db.query(
-        `select id, otp_hash, attempts, max_attempts
-         from auth_otp_requests
-         where phone_e164 = $1
-           and purpose = 'login'
-           and is_verified = false
-           and consumed_at is null
-           and expires_at > now()
-         order by created_at desc
-         limit 1`,
-        [phone]
-      );
+      if (provider === 'twilio-verify') {
+        const ok = await this.checkTwilioVerification(phone, otp);
+        if (!ok) {
+          return res.status(400).json({ error: 'Incorrect or expired OTP.' });
+        }
+      } else {
+        const otpResult = await this.db.query(
+          `select id, otp_hash, attempts, max_attempts
+           from auth_otp_requests
+           where phone_e164 = $1
+             and purpose = 'login'
+             and is_verified = false
+             and consumed_at is null
+             and expires_at > now()
+           order by created_at desc
+           limit 1`,
+          [phone]
+        );
 
-      const otpRow = otpResult.rows[0];
-      if (!otpRow) {
-        return res.status(400).json({ error: 'OTP expired. Please request a new OTP.' });
+        const otpRow = otpResult.rows[0];
+        if (!otpRow) {
+          return res.status(400).json({ error: 'OTP expired. Please request a new OTP.' });
+        }
+
+        if (otpRow.attempts >= otpRow.max_attempts) {
+          return res.status(429).json({ error: 'Too many attempts. Please request a new OTP.' });
+        }
+
+        if (otpRow.otp_hash !== this.authService.hashOtp(phone, otp)) {
+          await this.db.query('update auth_otp_requests set attempts = attempts + 1 where id = $1', [otpRow.id]);
+          return res.status(400).json({ error: 'Incorrect OTP.' });
+        }
+
+        await this.db.query(
+          'update auth_otp_requests set is_verified = true, consumed_at = now(), attempts = attempts + 1 where id = $1',
+          [otpRow.id]
+        );
       }
-
-      if (otpRow.attempts >= otpRow.max_attempts) {
-        return res.status(429).json({ error: 'Too many attempts. Please request a new OTP.' });
-      }
-
-      if (otpRow.otp_hash !== this.authService.hashOtp(phone, otp)) {
-        await this.db.query('update auth_otp_requests set attempts = attempts + 1 where id = $1', [otpRow.id]);
-        return res.status(400).json({ error: 'Incorrect OTP.' });
-      }
-
-      await this.db.query(
-        'update auth_otp_requests set is_verified = true, consumed_at = now(), attempts = attempts + 1 where id = $1',
-        [otpRow.id]
-      );
 
       const userResult = await this.db.query(
         `insert into users (phone_e164, last_login_at)
@@ -108,6 +190,7 @@ export class AuthController {
       return res.json({
         ok: true,
         authenticated: true,
+        provider,
         user: {
           id: user.id,
           phone: user.phone_e164,
